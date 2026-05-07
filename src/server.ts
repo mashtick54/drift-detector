@@ -598,7 +598,7 @@ app.get('/billing', requireAuth, (c) => {
 });
 
 app.post('/billing/upgrade', requireAuth, upgradeHandler);
-app.get('/billing/verify', requireAuth, verifyBillingHandler);
+app.get('/billing/verify', verifyBillingHandler);
 app.post('/billing/webhook', webhookHandler);
 
 // Cron job: Every 60 minutes

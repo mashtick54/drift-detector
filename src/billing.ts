@@ -103,7 +103,7 @@ export const upgradeHandler = async (c: Context) => {
       user.email,
       90000, // KES 900 in kobo
       { userId: user.id, plan: 'pro' },
-      `\${origin}/billing/verify`
+      `${origin}/billing/verify?userId=${user.id}`
     );
     return c.redirect(data.authorization_url);
   } catch (error: any) {
@@ -114,24 +114,35 @@ export const upgradeHandler = async (c: Context) => {
 
 export const verifyBillingHandler = async (c: Context) => {
   const reference = c.req.query('reference');
+  const userIdFromQuery = c.req.query('userId');
+  
   if (!reference) return c.redirect('/billing?error=no_reference');
 
   try {
     const data = await verifyTransaction(reference);
+    console.log('Paystack verification full response:', JSON.stringify(data, null, 2));
+
     if (data.status === 'success') {
-      const userId = data.metadata.userId;
+      const userIdFromMetadata = data.metadata.userId;
       const plan = data.metadata.plan;
       
-      dbCreateSubscription(userId, plan, data.customer.customer_code, data.subscription);
-      updateUserPlan(userId, plan);
-      
-      // TODO: Send confirmation email
+      // Validate userId from metadata against query to prevent tampering
+      if (String(userIdFromMetadata) !== String(userIdFromQuery)) {
+        console.error('UserId mismatch! Metadata:', userIdFromMetadata, 'Query:', userIdFromQuery);
+        return c.redirect('/billing?error=security_mismatch');
+      }
+
+      console.log('Payment successful! Upgrading user', userIdFromMetadata, 'to', plan);
+      dbCreateSubscription(userIdFromMetadata, plan, data.customer.customer_code, data.subscription_code || data.subscription);
+      updateUserPlan(userIdFromMetadata, plan);
       
       return c.redirect('/billing?success=1');
+    } else {
+      console.warn('Payment verification failed status:', data.status);
     }
     return c.redirect('/billing?error=failed');
   } catch (error: any) {
-    console.error('Verification failed:', error);
+    console.error('Verification exception:', error);
     return c.redirect('/billing?error=verify');
   }
 };
