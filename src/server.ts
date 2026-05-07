@@ -12,29 +12,31 @@ import {
   getAllDiffsWithEndpoint,
   getDiffs,
   getTotalDiffsCount,
-  getGlobalLastChecked
+  getGlobalLastChecked,
+  createApiKey
 } from './db';
 import { inferSchema, fingerprint } from './inferSchema';
 import { diffSchemas } from './diffSchemas';
 import { sendBreakingChangeAlert } from './alerts';
+import { apiKeyMiddleware, adminSecretMiddleware, AuthContext } from './auth';
 
-const app = new Hono();
+const app = new Hono<AuthContext>();
 
 // Utility function to process an endpoint check
-async function checkEndpoint(endpoint: any, data: unknown) {
+async function checkEndpoint(apiKeyId: number | bigint | null, endpoint: any, data: unknown) {
   const schema = inferSchema(data);
   const fp = fingerprint(schema);
   const schemaJson = JSON.stringify(schema);
 
-  const lastSnapshot = getLastSnapshot(endpoint.id);
-  const snapshotId = insertSnapshot(endpoint.id, schemaJson, fp);
+  const lastSnapshot = getLastSnapshot(apiKeyId, endpoint.id);
+  const snapshotId = insertSnapshot(apiKeyId, endpoint.id, schemaJson, fp);
 
   if (lastSnapshot && lastSnapshot.fingerprint !== fp) {
     const lastSchema = JSON.parse(lastSnapshot.schema_json);
     const diffs = diffSchemas(lastSchema, schema);
     
     if (diffs.length > 0) {
-      insertDiff(endpoint.id, lastSnapshot.id, snapshotId, JSON.stringify(diffs));
+      insertDiff(apiKeyId, endpoint.id, lastSnapshot.id, snapshotId, JSON.stringify(diffs));
       
       const breaking = diffs.filter(d => d.severity === 'breaking');
       if (breaking.length > 0) {
@@ -57,8 +59,8 @@ app.get('/', (c) => {
   const lastCheckedStr = globalLastChecked ? new Date(globalLastChecked).toLocaleString() : 'Never';
 
   const endpointCards = endpoints.map(e => {
-    const lastSnapshot = getLastSnapshot(e.id);
-    const lastDiff = getDiffs(e.id)[0];
+    const lastSnapshot = getLastSnapshot(e.api_key_id, e.id);
+    const lastDiff = getDiffs(e.api_key_id, e.id)[0];
     const isStable = !lastDiff;
     const statusText = isStable ? 'Stable' : 'Drift Detected';
     const statusColor = isStable ? '#10b981' : '#ef4444';
@@ -281,20 +283,23 @@ app.get('/', (c) => {
 });
 
 // 1. GET /endpoints
-app.get('/endpoints', (c) => {
-  const endpoints = getEndpoints();
+app.get('/endpoints', apiKeyMiddleware, (c) => {
+  const apiKey = c.get('apiKey');
+  const endpoints = getEndpoints(apiKey.id);
   return c.json(endpoints);
 });
 
 // 2. POST /endpoints
-app.post('/endpoints', async (c) => {
+app.post('/endpoints', apiKeyMiddleware, async (c) => {
+  const apiKey = c.get('apiKey');
   const { name, url, method, headers } = await c.req.json();
-  const id = insertEndpoint(name, url, method, headers || {});
+  const id = insertEndpoint(apiKey.id, name, url, method, headers || {});
   return c.json({ id, name, url, method, headers });
 });
 
 // 3. POST /proxy?target=<url>
-app.post('/proxy', async (c) => {
+app.post('/proxy', apiKeyMiddleware, async (c) => {
+  const apiKey = c.get('apiKey');
   const target = c.req.query('target');
   if (!target) return c.text('Missing target query param', 400);
 
@@ -311,20 +316,42 @@ app.post('/proxy', async (c) => {
   const responseData = await response.json();
   
   // Try to find if this endpoint exists in our DB to track it
-  const endpoints = getEndpoints();
+  const endpoints = getEndpoints(apiKey.id);
   const endpoint = endpoints.find(e => e.url === target);
   
   if (endpoint) {
-    await checkEndpoint(endpoint, responseData);
+    await checkEndpoint(apiKey.id, endpoint, responseData);
   }
 
   return c.json(responseData);
 });
 
+// 4. POST /keys
+app.post('/keys', async (c) => {
+  const { ownerEmail, name } = await c.req.json();
+  const apiKey = createApiKey(ownerEmail, name);
+  return c.json({ 
+    key: apiKey.key, 
+    ownerEmail: apiKey.owner_email, 
+    name: apiKey.name 
+  });
+});
+
+// 5. POST /keys/provision
+app.post('/keys/provision', adminSecretMiddleware, async (c) => {
+  const { ownerEmail, name } = await c.req.json();
+  const apiKey = createApiKey(ownerEmail, name);
+  return c.json({ 
+    key: apiKey.key, 
+    ownerEmail: apiKey.owner_email, 
+    name: apiKey.name 
+  });
+});
+
 // Cron job: Every 60 minutes
 cron.schedule('0 * * * *', async () => {
   console.log('Running scheduled drift check...');
-  const endpoints = getEndpoints();
+  const endpoints = getEndpoints(); // All endpoints across all tenants
   
   for (const endpoint of endpoints) {
     try {
@@ -333,7 +360,7 @@ cron.schedule('0 * * * *', async () => {
         headers: JSON.parse(endpoint.headers_json),
       });
       const data = await response.json();
-      await checkEndpoint(endpoint, data);
+      await checkEndpoint(endpoint.api_key_id, endpoint, data);
     } catch (error) {
       console.error(`Failed to check endpoint ${endpoint.name}:`, error);
     }
