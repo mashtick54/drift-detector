@@ -83,3 +83,13 @@ export function getAllDiffsWithEndpoint(): any[] {
     LIMIT 20
   `).all();
 }
+
+export function getTotalDiffsCount(): number {
+  const result = db.prepare('SELECT COUNT(*) as count FROM diffs').get() as any;
+  return result.count;
+}
+
+export function getGlobalLastChecked(): string | null {
+  const result = db.prepare('SELECT MAX(sampled_at) as last_checked FROM snapshots').get() as any;
+  return result.last_checked || null;
+}
